@@ -1,0 +1,43 @@
+# Hot tub display on an ESP32 dev board.
+# Copy this file to your ESPHome config folder, adjust the substitutions and
+# add api_key, wifi_ssid and wifi_password to your secrets.yaml.
+substitutions:
+  name: hottub-display
+  friendly_name: Hot Tub Display
+  # MAX7219 DIN / CS / CLK
+  pin_din: GPIO25
+  pin_cs: GPIO26
+  pin_clk: GPIO27
+  # Optional: first-boot source entities. You can also leave them out and set
+  # them in Home Assistant (device page -> Configuration).
+  # ha_hot_tub_temp: sensor.hot_tub_temperature
+  # ha_outdoor_temp: sensor.outdoor_temperature
+  # ha_wind_speed: sensor.wind_speed
+  # ha_wind_gust: sensor.wind_gust
+  # ha_wind_dir: sensor.wind_direction
+  # ha_solar_lux: sensor.solar_lux
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+logger:
+
+api:
+  encryption:
+    key: !secret api_key
+
+ota:
+  - platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+packages:
+  hottub: github://jut-a/esphome-max7219-hottub/max7219-hottub.yaml@0.1.0

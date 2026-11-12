@@ -1,0 +1,804 @@
+## ---------------------------------------------------------------------------##
+## ESPHome MAX7219 Hot Tub display — package                                  ##
+## 64x16 dot matrix (16 MAX7219 chips in 2 lines of 8) showing Home Assistant  ##
+## sensors: hot tub + outdoor temperature, wind, clocks, countdown.           ##
+##                                                                            ##
+## Include it from a device config and override the substitutions below;     ##
+## see examples/ and README.md.                                               ##
+## ---------------------------------------------------------------------------##
+substitutions:
+  # MAX7219 wiring (pins for an ESP32; examples/esp32-c3.yaml has C3 pins)
+  pin_din: GPIO25
+  pin_cs: GPIO26
+  pin_clk: GPIO27
+  # Module wiring: rotate_chip 0/90/180/270; ZIGZAG = both lines start at the
+  # same end, SNAKE = the second line runs back
+  matrix_rotate_chip: "0"
+  matrix_lines_style: ZIGZAG
+
+  # Home Assistant source entities. Only first-boot defaults: afterwards they
+  # are set under Configuration on the device page in HA. Empty = unused.
+  ha_hot_tub_temp: ""
+  ha_outdoor_temp: ""
+  ha_wind_speed: ""
+  ha_wind_gust: ""
+  ha_wind_dir: ""
+  ha_solar_lux: ""   # drives Auto brightness
+  # Compass bearing the viewer faces when looking at the display (first-boot default)
+  viewer_facing_initial: "0"
+
+esphome:
+  # Relative paths below resolve next to this file from 2026.10.2 on
+  min_version: 2026.10.2
+
+# max7219digit: replaces ESPHome's own driver with batched SPI frames and a
+# periodic control register refresh (see the header of max7219digit.h).
+# ha_dynamic: HA sensors whose entity ID comes from a text entity.
+external_components:
+  - source:
+      type: local
+      path: components
+    components: [max7219digit, ha_dynamic]
+
+## -----------------------##
+## HA Sensors             ##
+## -----------------------##
+# Entity IDs come from the text entities below, so they can be changed in HA
+# without reflashing. A change reboots the device ~5 s later to resubscribe.
+sensor:
+  - platform: ha_dynamic
+    id: hot_tub_temp
+    entity_id_text: hot_tub_temp_entity
+
+  - platform: ha_dynamic
+    id: outdoor_temp
+    entity_id_text: outdoor_temp_entity
+
+  - platform: ha_dynamic
+    id: wind_speed
+    entity_id_text: wind_speed_entity
+
+  - platform: ha_dynamic
+    id: wind_gust
+    entity_id_text: wind_gust_entity
+
+  - platform: ha_dynamic
+    id: solar_lux
+    entity_id_text: solar_lux_entity
+
+  - platform: ha_dynamic
+    id: wind_direction
+    entity_id_text: wind_direction_entity
+
+text:
+  - platform: template
+    id: hot_tub_temp_entity
+    name: "Hot Tub Temp Entity"
+    initial_value: "${ha_hot_tub_temp}"
+    <<: &ha_entity_text
+      icon: mdi:link-variant
+      entity_category: config
+      mode: text
+      optimistic: true
+      restore_value: true
+      # HA rejects anything but an entity ID (or empty = sensor unused)
+      pattern: '^([a-z0-9_]+\.[a-z0-9_]+)?$'
+
+  - platform: template
+    id: outdoor_temp_entity
+    name: "Outdoor Temp Entity"
+    initial_value: "${ha_outdoor_temp}"
+    <<: *ha_entity_text
+
+  - platform: template
+    id: wind_speed_entity
+    name: "Wind Speed Entity"
+    initial_value: "${ha_wind_speed}"
+    <<: *ha_entity_text
+
+  - platform: template
+    id: wind_gust_entity
+    name: "Wind Gust Entity"
+    initial_value: "${ha_wind_gust}"
+    <<: *ha_entity_text
+
+  - platform: template
+    id: solar_lux_entity
+    name: "Solar Lux Entity"
+    initial_value: "${ha_solar_lux}"
+    <<: *ha_entity_text
+
+  - platform: template
+    id: wind_direction_entity
+    name: "Wind Direction Entity"
+    initial_value: "${ha_wind_dir}"
+    <<: *ha_entity_text
+
+text_sensor:
+  - platform: template
+    id: countdown_remaining
+    name: "Countdown"
+    icon: mdi:timer-outline
+    lambda: |-
+      int secs = id(countdown_secs);
+      if (secs <= 0) {
+        if (id(countdown_done)) return {"DONE"};
+        return {"--:--"};
+      }
+      char buf[12];
+      snprintf(buf, sizeof(buf), "%02d:%02d", secs / 60, secs % 60);
+      return {buf};
+    update_interval: 1s
+
+# Own clock with its own ID: package lists are appended, not merged by ID, so
+# sharing a time component with the device config would clash
+time:
+  - platform: homeassistant
+    id: matrix_time
+
+## -----------------------##
+## SPI + Display          ##
+## -----------------------##
+spi:
+  - id: matrix_spi
+    clk_pin: ${pin_clk}
+    mosi_pin: ${pin_din}
+
+display:
+  - platform: max7219digit
+    id: led_matrix
+    spi_id: matrix_spi
+    cs_pin: ${pin_cs}
+    num_chips: 16
+    num_chip_lines: 2
+    chip_lines_style: ${matrix_lines_style}
+    data_rate: 4MHz # 15-20 cm cable; a frame is 256 bytes with the batched driver
+    intensity: 0    # boot level; the apply_brightness script takes over once the driver runs
+    rotate_chip: ${matrix_rotate_chip}
+    scroll_enable: false
+    update_interval: never    # rendered + pushed by the 200ms interval
+    lambda: |-
+      // Helper: pixel width of string (period=3, colon=2, space=3, minus=5, else=7)
+      auto str_px = [](const char *s) -> int {
+        int w = 0;
+        for (; *s; s++) {
+          if (*s == '.') w += 3;
+          else if (*s == ':') w += 2;
+          else if (*s == ' ') w += 3;
+          else if (*s == '-') w += 5;
+          else w += 7;
+        }
+        return w;
+      };
+
+      // --- Boot screen ---
+      if (id(boot_phase) == 0) {
+        it.print(0, 0, id(digit_font), "Booting");
+        it.print(0, 8, id(digit_font), "...");
+        return;
+      }
+      if (id(boot_phase) == 1) {
+        char ip[network::IP_ADDRESS_BUFFER_SIZE];
+        network::get_ip_addresses()[0].str_to(ip);
+        int w = str_px(ip);
+        int scroll = 0;
+        if (w > 64) {
+          int frame = id(boot_scroll_x);
+          id(boot_scroll_x)++;
+          if (frame > 5) {  // ~1s pause before scrolling
+            scroll = frame - 5;
+            if (scroll > w - 64) scroll = w - 64;  // stop at end
+          }
+        }
+        it.print(-scroll, 4, id(digit_font), ip);
+        return;
+      }
+
+      // Countdown DONE overlay — flashes on top of any preset
+      if (id(countdown_done)) {
+        if (id(colon_blink))
+          it.print(5, -4, id(big_font), "DONE!");
+        return;
+      }
+
+      // --- Icon bitmaps (7 wide × 8 tall) ---
+      static const uint8_t ICON_TUB[] = {
+        0b0101010,
+        0b1010101,
+        0b0000000,
+        0b0111110,
+        0b1000001,
+        0b1000001,
+        0b1111111,
+        0b0000000,
+      };
+      static const uint8_t ICON_THERM[] = {
+        0b0010000,
+        0b0101011,
+        0b0101000,
+        0b0111011,
+        0b0111000,
+        0b1111100,
+        0b1111100,
+        0b0111000,
+      };
+      static const uint8_t ICON_WIND[] = {
+        0b0000000,
+        0b0000110,
+        0b1111001,
+        0b0000000,
+        0b0111110,
+        0b0000001,
+        0b1111100,
+        0b0000000,
+      };
+      // Line arrows, clockwise from up in 45° steps: 5x5 in rows 2-6, centred
+      // on the digits (rows 9-15). Diagonal wings 2 px on up/down/side, 3 px
+      // straight wings on the diagonals, so all 8 look about the same size.
+      static const uint8_t ICON_ARROW[8][8] = {
+        {0, 0, 0b0001000, 0b0011100, 0b0101010, 0b0001000, 0b0001000, 0},
+        {0, 0, 0b0011110, 0b0000110, 0b0001010, 0b0010010, 0b0100000, 0},
+        {0, 0, 0b0001000, 0b0000100, 0b0111110, 0b0000100, 0b0001000, 0},
+        {0, 0, 0b0100000, 0b0010010, 0b0001010, 0b0000110, 0b0011110, 0},
+        {0, 0, 0b0001000, 0b0001000, 0b0101010, 0b0011100, 0b0001000, 0},
+        {0, 0, 0b0000010, 0b0100100, 0b0101000, 0b0110000, 0b0111100, 0},
+        {0, 0, 0b0001000, 0b0010000, 0b0111110, 0b0010000, 0b0001000, 0},
+        {0, 0, 0b0111100, 0b0110000, 0b0101000, 0b0100100, 0b0000010, 0},
+      };
+
+      // Helper: draw a 7x8 icon
+      auto draw_icon = [&](int ox, int oy, const uint8_t *icon) {
+        for (int row = 0; row < 8; row++) {
+          uint8_t bits = icon[row];
+          for (int col = 0; col < 7; col++) {
+            if (bits & (1 << (6 - col)))
+              it.draw_pixel_at(ox + col, oy + row, Color::WHITE);
+          }
+        }
+      };
+
+      // Helper: draw HH:MM with optional blinking colon
+      auto draw_time = [&](int x, int y, bool blink) {
+        if (!id(matrix_time).now().is_valid()) return;
+        auto now = id(matrix_time).now();
+        it.strftime(x, y, id(digit_font), "%H", now);
+        int cx = x + 14;
+        if (!blink || id(colon_blink))
+          it.print(cx, y, id(digit_font), ":");
+        it.strftime(cx + 2, y, id(digit_font), "%M", now);
+      };
+
+      // Helper: big "AA:BB" in clock_font (digits 11px, colon 6px; 50px for
+      // 2+2 digits). Colon drawn on its own so BB doesn't move when it blinks.
+      auto draw_big_pair = [&](int x, int a, int b, bool colon) {
+        char buf[8];
+        int n = snprintf(buf, sizeof(buf), "%02d", a);
+        it.print(x, -5, id(clock_font), buf);
+        x += n * 11;
+        if (colon)
+          it.print(x, -5, id(clock_font), ":");
+        snprintf(buf, sizeof(buf), "%02d", b);
+        it.print(x + 6, -5, id(clock_font), buf);
+      };
+
+      // Helper: wind value in the HA sensor's own unit, "--" while it has no value
+      auto fmt_wind = [](char *buf, size_t len, float v, int decimals) {
+        if (std::isnan(v))
+          snprintf(buf, len, "--");
+        else
+          snprintf(buf, len, "%.*f", decimals, v);
+      };
+
+      // Helper: temperature in the "Temperature Unit" chosen in HA, converted when
+      // the HA sensor reports the other unit (a US install sends °F)
+      const bool want_f = id(temp_unit).current_option() == "°F";
+      auto disp_temp = [&](ha_dynamic::HaDynamicSensor *s) {
+        const std::string &u = s->get_source_unit();
+        if (want_f && !u.empty() && u.back() == 'C')
+          return s->state * 9.0f / 5.0f + 32.0f;
+        if (!want_f && !u.empty() && u.back() == 'F')
+          return (s->state - 32.0f) * 5.0f / 9.0f;
+        return s->state;
+      };
+
+      // Helper: outdoor temperature, one decimal only for single digits
+      auto fmt_outdoor = [&](char *buf, size_t len) {
+        if (std::isnan(id(outdoor_temp).state))
+          return false;
+        float t = disp_temp(id(outdoor_temp));
+        if (t > -10 && t < 10)
+          snprintf(buf, len, "%.1f", t);
+        else
+          snprintf(buf, len, "%d", (int) lroundf(t));
+        return true;
+      };
+
+      std::string preset = id(display_preset).current_option();
+
+      // =====================
+      // PRESET: Hot Tub
+      // =====================
+      if (preset == "Hot Tub") {
+        // Top left: Hot tub temp
+        draw_icon(0, 0, ICON_TUB);
+        if (!std::isnan(id(hot_tub_temp).state)) {
+          // No decimal from 100 (°F), so a 3-digit outdoor value still fits
+          float t = disp_temp(id(hot_tub_temp));
+          it.printf(9, 0, id(digit_font), t > -10 && t < 100 ? "%.1f" : "%.0f", t);
+        }
+
+        // Top right: Outdoor temp
+        draw_icon(57, 0, ICON_THERM);
+        char obuf[8];
+        if (fmt_outdoor(obuf, sizeof(obuf)))
+          it.print(57 - str_px(obuf), 0, id(digit_font), obuf);
+
+        // Bottom left: Time
+        draw_time(1, 8, true);
+
+        // Bottom right: Wind speed/gust, with an arrow showing where the wind
+        // blows relative to the viewer (up = away from them, down = at them).
+        // Plain wind icon without a direction or when the speed reads 0.
+        float wdir = id(wind_direction).state;
+        float wspd = id(wind_speed).state;
+        if (std::isnan(wdir) || (!std::isnan(wspd) && wspd <= 0)) {
+          draw_icon(57, 8, ICON_WIND);
+        } else {
+          // Blows toward wdir + 180; screen up = the bearing the viewer faces
+          float a = fmodf(wdir + 180.0f - id(viewer_facing).state, 360.0f);
+          if (a < 0) a += 360.0f;
+          draw_icon(57, 8, ICON_ARROW[(int) lroundf(a / 45.0f) % 8]);
+        }
+        char wbuf[8];
+        float wval = id(wind_toggle) ? id(wind_gust).state : id(wind_speed).state;
+        fmt_wind(wbuf, sizeof(wbuf), wval, 1);
+        // No decimal from 100 ("100.0" is 31 px and would run into the clock)
+        if (str_px(wbuf) > 24)
+          fmt_wind(wbuf, sizeof(wbuf), wval, 0);
+        it.print(57 - str_px(wbuf), 8, id(digit_font), wbuf);
+      }
+
+      // =====================
+      // PRESET: Wall Clock
+      // =====================
+      else if (preset == "Wall Clock") {
+        if (!id(matrix_time).now().is_valid()) return;
+        auto now = id(matrix_time).now();
+        // Left: HH:MM, colon blinking; lit columns 1-48, seconds start at 52
+        draw_big_pair(0, now.hour, now.minute, now.second % 2 == 0);
+        // Bottom right: seconds in small matching font
+        char ss[4];
+        snprintf(ss, sizeof(ss), "%02d", now.second);
+        it.print(52, 5, id(small_font), ss);
+      }
+
+      // =====================
+      // PRESET: Night Clock
+      // =====================
+      else if (preset == "Night Clock") {
+        // Lowest brightness: see the apply_brightness script
+        if (!id(matrix_time).now().is_valid()) return;
+        auto now = id(matrix_time).now();
+        // Centered: (64 - 50) / 2
+        draw_big_pair(7, now.hour, now.minute, true);
+      }
+
+      // =====================
+      // PRESET: Hot Tub Big
+      // =====================
+      else if (preset == "Hot Tub Big") {
+        if (std::isnan(id(hot_tub_temp).state)) {
+          it.print(32, -5, id(clock_font), TextAlign::TOP_CENTER, "---");
+          return;
+        }
+        char buf[12];
+        float t = disp_temp(id(hot_tub_temp));
+        // Centered; no decimal from 100: "38.5°c" 58px, "102°f" 49px ("104.5°f" would be 66)
+        snprintf(buf, sizeof(buf), t > -10 && t < 100 ? "%.1f\xC2\xB0%s" : "%.0f\xC2\xB0%s", t,
+                 want_f ? "f" : "c");
+        it.print(32, -5, id(clock_font), TextAlign::TOP_CENTER, buf);
+      }
+
+      // =====================
+      // PRESET: Weather
+      // =====================
+      else if (preset == "Weather") {
+        // Row 0: outdoor temp with icon
+        draw_icon(0, 0, ICON_THERM);
+        char obuf[8];
+        if (fmt_outdoor(obuf, sizeof(obuf)))
+          it.print(8, 0, id(digit_font), obuf);
+
+        // Row 0 right: time
+        draw_time(34, 0, true);
+
+        // Row 1: scrolling wind info
+        draw_icon(0, 8, ICON_WIND);
+        char ws[8], wg[8], line[32];
+        // One decimal unless "speed / gust" would run off the display: with both
+        // from 10 up ("12.5 / 25.3" is 61 px, 56 fit), usual in km/h, mph or knots
+        for (int decimals = 1; decimals >= 0; decimals--) {
+          fmt_wind(ws, sizeof(ws), id(wind_speed).state, decimals);
+          fmt_wind(wg, sizeof(wg), id(wind_gust).state, decimals);
+          snprintf(line, sizeof(line), "%s / %s", ws, wg);
+          if (8 + str_px(line) <= 64)
+            break;
+        }
+        it.print(8, 8, id(digit_font), line);
+      }
+
+      // =====================
+      // PRESET: Countdown
+      // =====================
+      else if (preset == "Countdown") {
+        int secs = id(countdown_secs);
+        if (secs < 0) secs = 0;
+        int mm = secs / 60;
+        int ss = secs % 60;
+
+        if (secs == 0) return;
+
+        // Big MM:SS, centered: 50px, or 61px from 100 minutes up
+        draw_big_pair(mm >= 100 ? 1 : 7, mm, ss, id(colon_blink));
+      }
+
+      // =====================
+      // PRESET: Binary Clock
+      // =====================
+      else if (preset == "Binary Clock") {
+        if (!id(matrix_time).now().is_valid()) return;
+        auto now = id(matrix_time).now();
+        // BCD digits: H tens, H ones, M tens, M ones, S tens, S ones
+        int digits[] = {
+          now.hour / 10, now.hour % 10,
+          now.minute / 10, now.minute % 10,
+          now.second / 10, now.second % 10
+        };
+        // Column x positions: 6px bars, 2px apart within H / M / S, 6px between (cols 5-58)
+        const int cx[] = {5, 13, 25, 33, 45, 53};
+        // Max value each BCD digit can take (skip impossible bit rows)
+        const int mx[] = {2, 9, 5, 9, 5, 9};
+        for (int c = 0; c < 6; c++) {
+          for (int r = 0; r < 4; r++) {
+            int bv = 8 >> r;  // bit value: 8, 4, 2, 1
+            if (bv > mx[c]) continue;
+            int x = cx[c], y = r * 4;
+            if (digits[c] & bv) {
+              // ON: filled 6x3 bar
+              it.filled_rectangle(x, y, 6, 3);
+            } else {
+              // OFF: hollow 6x3 bar
+              it.rectangle(x, y, 6, 3);
+            }
+          }
+        }
+      }
+
+font:
+  - file: fonts/VictoriaBold-8-tight.bdf
+    id: digit_font
+    glyphs: ' !"%()+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
+
+  - file:
+      type: gfonts
+      family: DotGothic16
+    id: big_font
+    size: 16
+    glyphs: ' +-./0123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz!°'
+
+  # Wall Clock, Night Clock, Countdown, Hot Tub Big: 3px strokes, tabular digits,
+  # 16 rows tall at y=-5
+  - file:
+      type: gfonts
+      family: Roboto Condensed
+      weight: 700
+    id: clock_font
+    size: 22
+    glyphs: '0123456789:.-°cf'
+
+  - file:
+      type: gfonts
+      family: DotGothic16
+    id: small_font
+    size: 8
+    glyphs: '0123456789'
+
+## -----------------------##
+## Display controls       ##
+## -----------------------##
+switch:
+  - platform: template
+    id: display_power
+    name: "Display"
+    icon: mdi:monitor
+    restore_mode: RESTORE_DEFAULT_ON
+    optimistic: true
+    on_turn_off:
+      - script.execute: display_apply
+    on_turn_on:
+      - script.execute: display_apply
+
+script:
+  # Off = chips in shutdown; the 200ms interval then skips render + SPI push.
+  - id: display_apply
+    then:
+      - if:
+          condition:
+            switch.is_on: display_power
+          then:
+            - lambda: |-
+                // The switch restores at boot before the driver allocates its frame
+                // buffer in setup(); update() would crash. The 200ms interval re-applies later.
+                if (!id(led_matrix).is_ready()) return;
+                id(led_matrix).update();       // fresh frame before waking chips
+                id(led_matrix).display();
+                id(led_matrix).turn_on_off(true);
+          else:
+            - lambda: 'id(led_matrix).turn_on_off(false);'
+
+  # The one place that sets the brightness: Night Clock = lowest, Manual = the
+  # Brightness number, Auto = from solar lux (the Brightness number when no Solar
+  # Lux Entity is set). Run on every mode / preset / Brightness change, every 10 s
+  # and once the driver runs.
+  - id: apply_brightness
+    then:
+      - lambda: |-
+          // The selects and the number restore before the driver's setup() and
+          // before the Solar Lux Entity text; the driver boots at intensity 0 and
+          // the 200ms interval runs this once it has taken over
+          if (!id(led_matrix).is_ready()) return;
+          int level;
+          const float manual = id(brightness_level).state;
+          const float lux = id(solar_lux).state;
+          const bool has_lux_sensor = !id(solar_lux_entity).state.empty();
+          if (id(display_preset).current_option() == "Night Clock") {
+            level = 0;
+          } else if (id(brightness_mode).current_option() == "Manual" || !has_lux_sensor) {
+            if (std::isnan(manual)) return;
+            level = (int) manual;
+          } else if (std::isnan(lux)) {
+            // No value yet (booting) or the sensor / Home Assistant is gone: keep the
+            // level rather than jumping to the Manual one, e.g. in the dark
+            return;
+          } else if (lux < 10) level = 0;
+          else if (lux < 100) level = 2;
+          else if (lux < 1000) level = 5;
+          else if (lux < 10000) level = 9;
+          else if (lux < 50000) level = 12;
+          else level = 15;
+          id(led_matrix).intensity(level);
+
+select:
+  - platform: template
+    id: brightness_mode
+    name: "Brightness Mode"
+    icon: mdi:brightness-auto
+    options:
+      - "Auto"
+      - "Manual"
+    initial_option: "Auto"
+    optimistic: true
+    restore_value: true
+    on_value:
+      - script.execute: apply_brightness
+
+  - platform: template
+    id: display_preset
+    name: "Display Preset"
+    icon: mdi:view-dashboard
+    options:
+      - "Hot Tub"
+      - "Wall Clock"
+      - "Night Clock"
+      - "Hot Tub Big"
+      - "Weather"
+      - "Countdown"
+      - "Binary Clock"
+    initial_option: "Hot Tub"
+    optimistic: true
+    restore_value: true
+    on_value:
+      - script.execute: apply_brightness
+
+  # Display unit for temperatures; values are converted when the HA sensor
+  # reports the other unit (HA sends °F on a US install)
+  - platform: template
+    id: temp_unit
+    name: "Temperature Unit"
+    icon: mdi:thermometer
+    entity_category: config
+    options:
+      - "°C"
+      - "°F"
+    initial_option: "°C"
+    optimistic: true
+    restore_value: true
+
+number:
+  - platform: template
+    id: brightness_level
+    name: "Brightness"
+    icon: mdi:brightness-6
+    min_value: 0
+    max_value: 15
+    step: 1
+    initial_value: 5
+    optimistic: true
+    restore_value: true
+    on_value:
+      - script.execute: apply_brightness
+
+  - platform: template
+    id: countdown_minutes
+    name: "Countdown Minutes"
+    icon: mdi:timer-outline
+    min_value: 1
+    max_value: 120
+    step: 1
+    initial_value: 60
+    optimistic: true
+
+  # Compass bearing the viewer faces when looking at the display (NE = 45).
+  # Turns the Hot Tub wind arrow so it points relative to the viewer.
+  - platform: template
+    id: viewer_facing
+    name: "Viewer Facing"
+    icon: mdi:compass-outline
+    entity_category: config
+    unit_of_measurement: "°"
+    min_value: 0
+    max_value: 359
+    step: 1
+    mode: box
+    initial_value: ${viewer_facing_initial}
+    optimistic: true
+    restore_value: true
+
+button:
+  - platform: template
+    name: "Start Countdown"
+    icon: mdi:timer-play
+    on_press:
+      then:
+        - lambda: |-
+            id(countdown_done) = false;
+            id(countdown_secs) = (int)(id(countdown_minutes).state * 60);
+
+  - platform: template
+    name: "Stop Countdown"
+    icon: mdi:timer-stop
+    on_press:
+      then:
+        - lambda: |-
+            id(countdown_secs) = 0;
+            id(countdown_done) = false;
+
+  # Logs a frame of the current preset as hex rows for tools/render_frames.py
+  # (README screenshots)
+  - platform: template
+    name: "Dump Frame"
+    icon: mdi:camera
+    entity_category: diagnostic
+    disabled_by_default: true
+    on_press:
+      then:
+        - lambda: |-
+            if (!id(led_matrix).is_ready()) return;
+            // Render into the buffer without pushing it to the chips, so this also
+            // works while the Display switch is off (nothing is rendered then)
+            id(led_matrix).update();
+            std::string preset = id(display_preset).current_option();
+            const int w = id(led_matrix).get_width_internal(), h = id(led_matrix).get_height_internal();
+            ESP_LOGI("frame", "begin %dx%d %s", w, h, preset.c_str());
+            for (int y = 0; y < h; y++) {
+              std::string row;
+              for (int c = 0; c < w / 4; c++) {
+                int nibble = 0;
+                for (int b = 0; b < 4; b++)
+                  nibble = nibble << 1 | id(led_matrix).get_pixel(c * 4 + b, y);
+                row += "0123456789abcdef"[nibble];
+              }
+              ESP_LOGI("frame", "%2d %s", y, row.c_str());
+            }
+
+## -----------------------##
+## Globals & intervals    ##
+## -----------------------##
+globals:
+  # 0 = "Booting..." until WiFi connects, 1 = IP for 5 s after each connect, 2 = preset
+  - id: boot_phase
+    type: int
+    restore_value: no
+    initial_value: "0"
+
+  - id: boot_ip_since
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+
+  - id: net_was_connected
+    type: bool
+    restore_value: no
+    initial_value: "false"
+
+  - id: matrix_started
+    type: bool
+    restore_value: no
+    initial_value: "false"
+
+  - id: wind_toggle
+    type: bool
+    restore_value: no
+    initial_value: "false"
+
+  - id: colon_blink
+    type: bool
+    restore_value: no
+    initial_value: "true"
+
+  - id: countdown_secs
+    type: int
+    restore_value: no
+    initial_value: "0"
+
+  - id: boot_scroll_x
+    type: int
+    restore_value: no
+    initial_value: "0"
+
+  - id: countdown_done
+    type: bool
+    restore_value: no
+    initial_value: "false"
+
+interval:
+  # Render + push one frame (~4 ms with the batched driver at 4 MHz). Replaces
+  # the driver's poller and loop(), which re-sent the full frame on every loop
+  # pass. Boot handling lives here rather than in on_boot / wifi on_connect:
+  # a device config's own single on_boot or on_connect would replace those.
+  - interval: 200ms
+    then:
+      - lambda: |-
+          const bool conn = network::is_connected();
+          if (conn && !id(net_was_connected)) {
+            id(boot_phase) = 1;
+            id(boot_scroll_x) = 0;
+            id(boot_ip_since) = millis();
+          } else if (id(boot_phase) == 1 && millis() - id(boot_ip_since) >= 5000) {
+            id(boot_phase) = 2;
+          }
+          id(net_was_connected) = conn;
+
+          if (!id(led_matrix).is_ready()) return;
+          if (!id(matrix_started)) {
+            // Take over frame pushing, and apply the Display switch restored
+            // before the driver had a frame buffer
+            id(matrix_started) = true;
+            id(led_matrix).disable_loop();
+            id(display_apply).execute();
+            id(apply_brightness).execute();
+            return;
+          }
+          if (!id(display_power).state) return;
+          id(led_matrix).update();
+          id(led_matrix).display();
+
+  - interval: 3s
+    then:
+      - lambda: |-
+          id(wind_toggle) = !id(wind_toggle);
+
+  - interval: 1s
+    then:
+      - lambda: |-
+          id(colon_blink) = !id(colon_blink);
+          if (id(countdown_secs) > 0) {
+            id(countdown_secs) -= 1;
+            if (id(countdown_secs) == 0)
+              id(countdown_done) = true;
+          }
+
+  # Auto brightness follows the lux sensor
+  - interval: 10s
+    then:
+      - script.execute: apply_brightness

@@ -1,0 +1,54 @@
+name: Bug report
+description: Something does not work as described
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. Please remove passwords, keys and other secrets from the YAML
+        before posting.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what the display actually showed.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Package version
+      description: The release your config includes (the part after @, e.g. 0.1.0)
+    validations:
+      required: true
+  - type: input
+    id: esphome_version
+    attributes:
+      label: ESPHome version
+      description: "`esphome version`, or the version in the ESPHome dashboard (e.g. 2026.10.2)"
+    validations:
+      required: true
+  - type: dropdown
+    id: board
+    attributes:
+      label: Board
+      options:
+        - ESP32
+        - ESP32-C3
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: Device YAML
+      description: Your device file, without secrets.
+      render: yaml
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Log
+      description: "`esphome logs your-file.yaml` from boot. For a drawing problem, add a Dump Frame log or the PNG from tools/render_frames.py."
+      render: text

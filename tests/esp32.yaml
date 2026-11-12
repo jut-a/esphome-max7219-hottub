@@ -1,0 +1,22 @@
+# CI build test: the package from this checkout, placeholder credentials.
+esphome:
+  name: ci-esp32
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+logger:
+
+api:
+
+ota:
+  - platform: esphome
+
+wifi:
+  ssid: ci-network
+  password: ci-password
+
+packages:
+  - !include ../max7219-hottub.yaml

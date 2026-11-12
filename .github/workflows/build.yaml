@@ -1,0 +1,47 @@
+name: Build
+
+# Compiles the package on an ESP32 and an ESP32-C3 with the current ESPHome release
+# (tests/*.yaml include max7219-hottub.yaml from this checkout). Also weekly: the
+# max7219digit component replaces ESPHome's own driver, so a new ESPHome release can
+# break the build without any change here.
+#
+# No build cache: GitHub drops caches unused for 7 days, and this repo only gets pushes
+# at releases, so it would rarely hit.
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "0 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compile:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        config: [tests/esp32.yaml, tests/esp32-c3.yaml]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+      - run: pip install esphome
+      - run: esphome compile ${{ matrix.config }}
+
+  # GitHub turns off scheduled workflows after 60 days without repository activity,
+  # which on a quiet repo would end the weekly check. Enabling the workflow through the
+  # API on every scheduled run keeps it on, without commits.
+  keepalive:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - run: gh api --method PUT "repos/${{ github.repository }}/actions/workflows/build.yaml/enable"
+        env:
+          GH_TOKEN: ${{ github.token }}

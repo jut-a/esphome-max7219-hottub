@@ -1,0 +1,27 @@
+# CI build test: the package from this checkout on an ESP32-C3, placeholder credentials.
+substitutions:
+  pin_din: GPIO7
+  pin_cs: GPIO10
+  pin_clk: GPIO6
+
+esphome:
+  name: ci-esp32-c3
+
+esp32:
+  board: esp32-c3-devkitm-1
+  framework:
+    type: esp-idf
+
+logger:
+
+api:
+
+ota:
+  - platform: esphome
+
+wifi:
+  ssid: ci-network
+  password: ci-password
+
+packages:
+  - !include ../max7219-hottub.yaml

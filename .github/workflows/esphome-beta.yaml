@@ -1,0 +1,42 @@
+name: ESPHome beta
+
+# The same build as build.yaml with the newest ESPHome on PyPI, beta included, so a change
+# to ESPHome's max7219digit driver or the APIs the package uses shows up before the
+# release.
+#
+# Not run on pushes or PRs, so it never blocks a merge: a red scheduled run e-mails the
+# repo owner.
+
+on:
+  schedule:
+    - cron: "0 4 * * 4"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compile:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        config: [tests/esp32.yaml, tests/esp32-c3.yaml]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+      - run: pip install --pre esphome
+      - run: esphome compile ${{ matrix.config }}
+
+  # See build.yaml: keeps this scheduled workflow from being turned off after 60 quiet days
+  keepalive:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - run: gh api --method PUT "repos/${{ github.repository }}/actions/workflows/esphome-beta.yaml/enable"
+        env:
+          GH_TOKEN: ${{ github.token }}
